@@ -104,9 +104,132 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     return result;
 }
 
+// 将任意类型转换为 float 进行计算
+__device__ __forceinline__ float to_float(float x) { return x; }
+__device__ __forceinline__ float to_float(half x) { return __half2float(x); }
+
+// 将 float 转换到目标类型
+__device__ __forceinline__ float from_float(float x, float*) { return x; }
+__device__ __forceinline__ half from_float(float x, half*) { return __float2half(x); }
+
+template <typename T, int HEAD_DIM_MAX = 128>
+__global__ void attention_kernel(
+    const T* __restrict__ Q,    // [batch, tgt_len, q_heads, head_dim]
+    const T* __restrict__ K,    // [batch, src_len, kv_heads, head_dim]
+    const T* __restrict__ V,    // [batch, src_len, kv_heads, head_dim]
+    T* __restrict__ O,          // [batch, tgt_len, q_heads, head_dim]
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads, int head_dim,
+    float scale, bool is_causal)
+{
+    // 计算当前线程块负责的 batch, head, query position
+    int batch_head = blockIdx.x;
+    int batch = batch_head / query_heads;
+    int head = batch_head % query_heads;
+    int q_pos = blockIdx.y;
+  
+    // GQA: 计算对应的 KV head
+    // query_heads 是 kv_heads 的整数倍，多个 query heads 共享一个 kv head
+    int heads_per_kv = query_heads / kv_heads;
+    int kv_head = head / heads_per_kv;
+    
+    // 边界检查
+    if (batch >= batch_size || q_pos >= target_seq_len) return;
+    
+    int tid = threadIdx.x;
+  
+    // 计算输入输出的基地址
+    // Q/O: [batch, seq, heads, dim] -> batch * (tgt_len * q_heads * dim) + seq * (q_heads * dim) + head * dim
+    // K/V: [batch, seq, heads, dim] -> batch * (src_len * kv_heads * dim) + seq * (kv_heads * dim) + head * dim
+    int q_base = batch * (target_seq_len * query_heads * head_dim) 
+                + q_pos * (query_heads * head_dim) 
+                + head * head_dim;
+    int kv_batch_base = batch * (src_seq_len * kv_heads * head_dim);
+    
+    // 每个线程加载 Q 的一部分到寄存器
+    float q_val = 0.0f;
+    if (tid < head_dim) {
+        q_val = to_float(Q[q_base + tid]);
+    }
+  
+    // 使用 shared memory 存储 K, V 的一个位置的数据
+    extern __shared__ char smem[];
+    float* s_kv = reinterpret_cast<float*>(smem);  // [2 * head_dim] for K and V
+    float* s_k = s_kv;
+    float* s_v = s_kv + head_dim;
+  
+    // Online softmax
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o_acc = 0.0f;  // 每个线程负责输出的一个维度
+    
+    // Causal mask 的上界：query position q_pos 只能 attend 到 <= q_pos 的位置
+    int kv_end = is_causal ? min(q_pos + 1, src_seq_len) : src_seq_len;
+    
+    // 遍历所有 KV positions
+    for (int kv_pos = 0; kv_pos < kv_end; kv_pos++) {
+        // 计算当前 KV position 的基地址
+        int kv_base = kv_batch_base + kv_pos * (kv_heads * head_dim) + kv_head * head_dim;
+        
+        // 协作加载 K[kv_pos] 和 V[kv_pos] 到 shared memory
+        if (tid < head_dim) {
+            s_k[tid] = to_float(K[kv_base + tid]);
+            s_v[tid] = to_float(V[kv_base + tid]);
+        }
+        __syncthreads();
+        
+        // 计算 attention score: Q[q_pos] · K[kv_pos] * scale
+        float score = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float q_d = (d < head_dim && d == tid) ? q_val : 
+                        (d < head_dim ? to_float(Q[q_base + d]) : 0.0f);
+            score += q_d * s_k[d];
+        }
+        
+        // 更简单的方式：让每个线程计算完整的点积
+        score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += to_float(Q[q_base + d]) * s_k[d];
+        }
+        score *= scale;
+        
+        // Online softmax 更新
+        // 计算新的 max
+        float m_new = fmaxf(m, score);
+        
+        // 计算校正因子
+        // alpha: 用于缩放之前累加的值
+        // beta: 用于缩放当前的值
+        float alpha = expf(m - m_new);
+        float beta = expf(score - m_new);
+        
+        // 更新 running sum
+        l = l * alpha + beta;
+        
+        // 更新 output accumulator
+        // o_new = o_old * alpha + exp(score - m_new) * V[kv_pos]
+        if (tid < head_dim) {
+            o_acc = o_acc * alpha + beta * s_v[tid];
+        }
+        
+        // 更新 running max
+        m = m_new;
+        
+        __syncthreads();
+    }
+    
+    // 最终归一化并写回输出
+    // O[q_pos] = o_acc / l
+    if (tid < head_dim && l > 0.0f) {
+        int o_idx = q_base + tid;
+        T* dummy = nullptr;
+        O[o_idx] = from_float(o_acc / l, dummy);
+    }
+}
+
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- *
+ * 
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -114,7 +237,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length
+ * @param[in] src_seq_len Source sequence length  
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -123,9 +246,59 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len,
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+    // 计算各张量大小
+    size_t q_size = batch_size * target_seq_len * query_heads * head_dim;
+    size_t kv_size = batch_size * src_seq_len * kv_heads * head_dim;
+    size_t o_size = q_size;
+    
+    // 确保输出向量大小正确
+    h_o.resize(o_size);
+    
+    // 分配设备内存
+    T *d_q, *d_k, *d_v, *d_o;
+    RUNTIME_CHECK(cudaMalloc(&d_q, q_size * sizeof(T)));
+    RUNTIME_CHECK(cudaMalloc(&d_k, kv_size * sizeof(T)));
+    RUNTIME_CHECK(cudaMalloc(&d_v, kv_size * sizeof(T)));
+    RUNTIME_CHECK(cudaMalloc(&d_o, o_size * sizeof(T)));
+    
+    // 拷贝输入到设备
+    RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice));
+    RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice));
+    RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice));
+    
+    // 计算 scale = 1 / sqrt(head_dim)
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    // 配置 kernel 启动参数
+    // Grid: (batch_size * query_heads, target_seq_len)
+    // Block: head_dim 线程（或最少 32 线程以利用 warp）
+    dim3 grid(batch_size * query_heads, target_seq_len);
+    int block_size = std::max(32, head_dim);  // 至少 32 线程以保证 warp 效率
+    
+    // Shared memory: 存储 K 和 V 的一个位置的数据
+    size_t smem_size = 2 * head_dim * sizeof(float);
+    
+    // 启动 kernel
+    attention_kernel<T><<<grid, block_size, smem_size>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim,
+        scale, is_causal);
+    
+    // 检查 kernel 执行错误
+    RUNTIME_CHECK(cudaGetLastError());
+    RUNTIME_CHECK(cudaDeviceSynchronize());
+    
+    // 拷贝结果回 host
+    RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost));
+    
+    // 释放设备内存
+    RUNTIME_CHECK(cudaFree(d_q));
+    RUNTIME_CHECK(cudaFree(d_k));
+    RUNTIME_CHECK(cudaFree(d_v));
+    RUNTIME_CHECK(cudaFree(d_o));
 }
 
 // *********************************************************************
